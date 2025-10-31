@@ -1,257 +1,165 @@
-
 # -*- coding: utf-8 -*-
-# EGY Stocks Signal Bot (Arabic UI)
-# ---------------------------------
-# متطلبات التشغيل:
-# - Python 3.10+
-# - مكتبات: python-telegram-bot==20.*, pandas, numpy, yfinance, ta, python-dotenv (اختياري)
-# - متغير بيئة: TELEGRAM_BOT_TOKEN
-#
-# ملاحظات هامة:
-# - بيانات EGX على Yahoo قد تتطلب رمزًا منتهيًا بـ ".CA" مثل "COMI.CA" (CIB).
-# - يمكنك استبدال مزود البيانات (DataProvider) بمزود آخر يناسب EGX إن أردت.
-
 import os
 import logging
-from datetime import timedelta
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import yfinance as yf
+from ta.momentum import RSIIndicator
 
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
+from telegram import ParseMode
+from telegram.ext import Updater, CommandHandler
 
-try:
-    import ta
-except Exception:
-    ta = None
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes
-)
-
-# --------------------------- إعدادات عامة ---------------------------
+# ========= إعداد اللوجز =========
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger("EGYStocksBot")
+logger = logging.getLogger("EGY-STOCKS-BOT")
 
-BOT_NAME = "EGY STOCKS BOT"
-DEFAULT_PERIOD = "6mo"      # مدة البيانات
-DEFAULT_INTERVAL = "1d"     # الفاصل الزمني
+# ========= مساعدات =========
+def egx_ticker(text: str) -> str:
+    """
+    يضيف .CA لو المستخدم كتب الرمز بدون اللاحقة
+    """
+    t = (text or "").strip().upper()
+    if not t.endswith(".CA"):
+        t = f"{t}.CA"
+    return t
 
-# --------------------------- مزود البيانات ---------------------------
-class DataProvider:
-    """واجهة عامة لمزود البيانات."""
-    def fetch(self, symbol: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
-        raise NotImplementedError
+def fetch_ohlc(ticker: str, period="9mo", interval="1d") -> pd.DataFrame:
+    """
+    تحميل بيانات الأسعار من ياهو فاينانس
+    """
+    df = yf.download(ticker, period=period, interval=interval,
+                     auto_adjust=True, progress=False)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df.dropna().copy()
+    return None
 
-class YahooProvider(DataProvider):
-    def fetch(self, symbol: str, period: str = DEFAULT_PERIOD, interval: str = DEFAULT_INTERVAL) -> pd.DataFrame:
-        if yf is None:
-            raise RuntimeError("مكتبة yfinance غير مثبتة.")
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval, auto_adjust=False)
-        if df is None or df.empty:
-            raise ValueError("تعذر جلب بيانات الرمز. تأكد من الرمز مثل COMI.CA أو ORHD.CA ...")
-        df = df.rename(columns=str.title)  # Open, High, Low, Close, Volume
-        df = df.dropna()
-        return df
+def swing_levels(series: pd.Series, lookback: int = 25):
+    """
+    دعم/مقاومة مبسطة: أقل/أعلى قيمة في نافذة حديثة
+    """
+    recent = series[-lookback:]
+    return float(recent.min()), float(recent.max())
 
-DATA_PROVIDER: DataProvider = YahooProvider()
+def trend_text(sma_fast: float, sma_slow: float) -> str:
+    if np.isnan(sma_fast) or np.isnan(sma_slow):
+        return "غير واضح"
+    return "صاعد" if sma_fast >= sma_slow else "هابط"
 
-# --------------------------- التحليل الفني ---------------------------
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """يضيف أعمدة المؤشرات الفنية اللازمة."""
-    if ta is None:
-        raise RuntimeError("مكتبة ta غير مثبتة. ثبّت 'ta' عبر pip.")
-    out = df.copy()
-    out["EMA_20"] = ta.trend.EMAIndicator(out["Close"], window=20).ema_indicator()
-    out["EMA_50"] = ta.trend.EMAIndicator(out["Close"], window=50).ema_indicator()
-    out["EMA_200"] = ta.trend.EMAIndicator(out["Close"], window=200).ema_indicator()
-    out["RSI_14"] = ta.momentum.RSIIndicator(out["Close"], window=14).rsi()
-    out["ATR_14"] = ta.volatility.AverageTrueRange(out["High"], out["Low"], out["Close"], window=14).average_true_range()
-    return out.dropna()
+def build_signal_message(ticker_raw: str) -> str:
+    ticker = egx_ticker(ticker_raw)
+    df = fetch_ohlc(ticker, period="9mo", interval="1d")
+    if df is None or df.empty or len(df) < 30:
+        return f"⚠️ لا توجد بيانات كافية للرمز: {ticker}\nجرّب رمز مختلف."
 
-def swing_levels(series: pd.Series, window: int = 10, lookback: int = 60):
-    """أقرب دعوم ومقاومات بسيطة من آخر 60 يومًا عبر قيعان/قمم محلية."""
-    s = series.tail(lookback).reset_index(drop=True)
-    lows = []
-    highs = []
-    for i in range(window, len(s) - window):
-        chunk = s.iloc[i-window:i+window+1]
-        val = s.iloc[i]
-        if val == chunk.min():
-            lows.append(float(val))
-        if val == chunk.max():
-            highs.append(float(val))
-    lows = sorted(list(set([round(x, 2) for x in lows])))
-    highs = sorted(list(set([round(x, 2) for x in highs])))
-    # نعيد آخر 5 دعوم (أقرب للأسعار الحديثة) وأول 5 مقاومات
-    return lows[-5:], highs[:5]
+    close = df["Close"]
+    # متوسطات
+    sma20  = close.rolling(20).mean()
+    sma50  = close.rolling(50).mean()
+    sma100 = close.rolling(100).mean()
 
-def trend_label(current_price: float, ema_short: float, ema_mid: float, ema_long: float):
-    now_trend = "صاعد" if current_price >= ema_short else "هابط"
-    mid_trend = "صاعد" if ema_mid >= ema_long else "هابط"
-    return now_trend, mid_trend
+    current_price = float(close.iloc[-1])
 
-def generate_reco_text(df: pd.DataFrame, symbol: str) -> str:
-    row = df.iloc[-1]
-    price = round(row["Close"], 2)
-    ema20 = round(row["EMA_20"], 2)
-    ema50 = round(row["EMA_50"], 2)
-    ema200 = round(row["EMA_200"], 2)
-    rsi = round(row["RSI_14"], 1)
-    atr = float(row["ATR_14"])
+    t_short  = trend_text(sma20.iloc[-1],  sma50.iloc[-1])
+    t_medium = trend_text(sma50.iloc[-1],  sma100.iloc[-1])
 
-    now_trend, mid_trend = trend_label(price, row["EMA_20"], row["EMA_50"], row["EMA_200"])
+    # دعم/مقاومة
+    sup, res = swing_levels(close, lookback=25)
 
-    # دعوم ومقاومات
-    lows, highs = swing_levels(df["Close"])
-    supports = ", ".join([f"{x:.2f}" for x in lows]) if lows else "—"
-    resistances = ", ".join([f"{x:.2f}" for x in highs]) if highs else "—"
+    # RSI
+    rsi = float(RSIIndicator(close, window=14).rsi().iloc[-1])
+    rsi_note = (
+        "قوّة شرائية"   if rsi >= 70 else
+        "تشبّع شرائي"  if rsi > 55  else
+        "تعادل نسبي"   if rsi >= 45 else
+        "تشبّع بيعي"
+    )
 
-    # نقاط شراء/وقف/أهداف مبسطة
-    last_20 = df["Close"].tail(20)
-    swing_low = float(last_20.min())
-    swing_high = float(last_20.max())
-    fib_382 = swing_high - 0.382 * (swing_high - swing_low)
-    buy_zone = round((row["EMA_20"] + fib_382) / 2, 2)
+    # نقاط إرشادية مبسطة
+    target1 = round(res, 2)
+    target2 = round(res * 1.035, 2)
+    stop    = round(sup * 0.985, 2)
+    buy_break     = round(res * 1.002, 2)             # شراء اختراق فوق المقاومة
+    buy_pullback  = round(max(sup, sma20.iloc[-1]), 2) # شراء على ارتداد من دعم/متوسط
 
-    stop_base = lows[-1] if lows else price * 0.93
-    stop = round(stop_base - 0.5 * atr, 2)
-
-    if highs:
-        # اختر أول مستوى أعلى من السعر إن وجد، وإلا أول مستوى على أي حال
-        higher_res = [h for h in highs if h > price]
-        t1 = higher_res[0] if higher_res else highs[0]
-        t2 = highs[1] if len(highs) > 1 else price + 1.5 * atr
-    else:
-        t1 = price + 1.0 * atr
-        t2 = price + 2.0 * atr
-    t1, t2 = round(float(t1), 2), round(float(t2), 2)
-
-    if price > row["EMA_20"] > row["EMA_50"] and rsi < 70:
-        idea = f"شراء مضارِب حول {buy_zone} بهدف {t1} ثم {t2} ووقف أسفل {stop}."
-    elif row["EMA_20"] > price > row["EMA_50"] and rsi <= 50:
-        idea = f"انتظار هبوط لمنطقة {buy_zone} ثم متابعة اختراق {t1}."
-    elif price < row["EMA_50"] and rsi < 40:
-        idea = "ضعيف حاليًا؛ يفضّل المراقبة حتى استعادة السعر فوق EMA50."
-    else:
-        idea = "محايد؛ ننتظر إشارة أوضح (اختراق/كسر)."
-
-    # صياغة الرسالة
     lines = []
-    lines.append(f"*{BOT_NAME}*")
-    lines.append(f"الرمز: *{symbol}* — السعر: *{price}*")
+    lines.append(f"📈 *EGY STOCKS BOT*")
     lines.append("")
-    lines.append(f"الاتجاه الحالي: *{now_trend}*")
-    lines.append(f"الاتجاه المتوسط: *{mid_trend}*")
+    lines.append(f"• السهم: *{ticker}*")
+    lines.append(f"• السعر الحالي: *{round(current_price,2)}*")
     lines.append("")
-    lines.append("مستويات الدعم:")
-    lines.append(f"`{supports}`")
+    lines.append(f"الاتجاه الحالي: *{t_short}*")
+    lines.append(f"الاتجاه المتوسط: *{t_medium}*")
     lines.append("")
-    lines.append("مستويات المقاومة:")
-    lines.append(f"`{resistances}`")
+    lines.append("مستويات الدعم والمقاومة:")
+    lines.append(f"• الدعم: *{round(sup,2)}*")
+    lines.append(f"• المقاومة: *{round(res,2)}*")
     lines.append("")
-    lines.append("توصيات التداول:")
-    lines.append(f"{idea}")
+    lines.append(f"RSI (14): *{round(rsi,1)}* → {rsi_note}")
     lines.append("")
-    lines.append(f"نقاط الشراء الرئيسية: *{buy_zone}*")
-    lines.append(f"المستهدفات: *{t1}* ثم *{t2}*  | وقف الخسارة: *{stop}*")
+    lines.append("توصيات تداول (إرشادية وليست نصيحة استثمار):")
+    lines.append(f"• شراء تأكيدي (اختراق): فوق *{buy_break}*")
+    lines.append(f"• شراء ارتداد: قرب *{buy_pullback}* (مع متابعة الحجم)")
+    lines.append(f"• الأهداف: *{target1}* ثم *{target2}*")
+    lines.append(f"• وقف الخسارة: أسفل *{stop}*")
     lines.append("")
-    lines.append(f"_مؤشرات:_ EMA20={ema20} | EMA50={ema50} | EMA200={ema200} | RSI14={rsi}")
+    lines.append(
+        "_⚠️ هذا البوت لأغراض تعليمية؛ التداول على مسؤوليتك الشخصية._"
+    )
     return "\n".join(lines)
 
-# --------------------------- أوامر البوت ---------------------------
-def example_symbols_text() -> str:
-    return "أمثلة لرموز EGX على ياهو: COMI.CA (CIB), EFIH.CA, SWDY.CA, TMGH.CA, ORHD.CA"
+# ========= الأوامر =========
+def start(update, context):
+    txt = (
+        "أهلاً بيك 👋\n\n"
+        "أنا بوت تحليلات سريعة لأسهم البورصة المصرية.\n"
+        "استخدم:\n"
+        "• /signal COMI  ← (اكتب رمز السهم من غير .CA)\n"
+        "• /help  ← للمساعدة\n\n"
+        "مثال: /signal COMI"
+    )
+    update.message.reply_text(txt)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("إشارة/Signal", switch_inline_query_current_chat="signal COMI.CA")],
-        [InlineKeyboardButton("مساعدة", callback_data="help")]
-    ]
-    await update.message.reply_text(
-        f"مرحبًا! أنا {BOT_NAME}.\nأرسل الأمر: /signal <الرمز> مثل /signal COMI.CA\n{example_symbols_text()}",
-        reply_markup=InlineKeyboardMarkup(kb)
+def help_cmd(update, context):
+    update.message.reply_text(
+        "المساعدة:\n"
+        "اكتب /signal يليه رمز السهم، مثال:\n"
+        "/signal ETEL\n"
+        "/signal EGAL\n"
+        "/signal SWDY\n\n"
+        "الرموز تُجلب من Yahoo Finance (لاحقة .CA تُضاف تلقائياً)."
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "الأوامر المتاحة:\n"
-        "/signal <رمز>  — إشارة تحليل فني مختصرة بنفس نسق الصورة.\n"
-        "/watchlist add <رمز> — إضافة للمتابعة\n"
-        "/watchlist remove <رمز> — حذف من المتابعة\n"
-        "/watchlist show — عرض قائمة المتابعة\n"
-        "مثال: /signal COMI.CA"
-    )
-    await update.message.reply_text(text)
-
-def get_user_watchlist(context: ContextTypes.DEFAULT_TYPE):
-    return context.user_data.setdefault("watchlist", set())
-
-async def watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    wl = get_user_watchlist(context)
-    if not args or args[0] == "show":
-        if not wl:
-            await update.message.reply_text("قائمة المتابعة فارغة.")
-        else:
-            await update.message.reply_text("قائمة المتابعة:\n" + ", ".join(sorted(wl)))
+def signal_cmd(update, context):
+    if len(context.args) == 0:
+        update.message.reply_text("اكتب الرمز بعد الأمر، مثال: /signal COMI")
         return
-    if args[0] == "add" and len(args) >= 2:
-        wl.add(args[1].upper())
-        await update.message.reply_text(f"تمت إضافة {args[1].upper()}")
-    elif args[0] == "remove" and len(args) >= 2:
-        wl.discard(args[1].upper())
-        await update.message.reply_text(f"تم حذف {args[1].upper()}")
-    else:
-        await update.message.reply_text("استخدام: /watchlist add <رمز> | remove <رمز> | show")
-
-async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استخدم: /signal <رمز> مثل /signal COMI.CA")
-        return
-    symbol = context.args[0].upper()
+    symbol = context.args[0]
     try:
-        df_raw = DATA_PROVIDER.fetch(symbol)
-        df = compute_indicators(df_raw)
-        text = generate_reco_text(df, symbol)
-        await update.message.reply_markdown(text)
+        msg = build_signal_message(symbol)
+        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.exception(e)
-        await update.message.reply_text(f"تعذر إصدار الإشارة: {e}\n{example_symbols_text()}")
+        logger.exception("signal error")
+        update.message.reply_text(f"حدث خطأ غير متوقع: {e}")
 
-async def inline_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not query:
-        return
-    if query.data == "help":
-        await query.answer()
-        await query.edit_message_text(
-            "أرسل /signal <رمز> للحصول على إشارة. يمكنك أيضًا استخدام /watchlist لإدارة قائمة المتابعة."
-        )
-
+# ========= التشغيل =========
 def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise RuntimeError("يرجى ضبط متغير البيئة TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(token).build()
+        raise RuntimeError("Environment variable TELEGRAM_BOT_TOKEN غير موجود.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("signal", signal_cmd))
-    app.add_handler(CommandHandler("watchlist", watchlist))
-    app.add_handler(CallbackQueryHandler(inline_help))
+    updater = Updater(token=token, use_context=True)
+    dp = updater.dispatcher
 
-    logger.info("Starting bot...")
-    app.run_polling()
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("signal", signal_cmd))
+
+    logger.info("Bot is starting…")
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
